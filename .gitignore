@@ -1,0 +1,52 @@
+# Node
+node_modules/
+.next/
+.turbo/
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Env files
+.env
+.env.local
+.env.*.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# pnpm
+pnpm-debug.log*
+
+# Vercel
+.vercel
+
+# Generated test artifacts
+apps/engine/test_output.pdf
