@@ -8,3 +8,5 @@ supabase==2.15.1
 svix==1.56.0
 fpdf2
 matplotlib
+google-generativeai
+antlr4-python3-runtime>=4.11,<4.12

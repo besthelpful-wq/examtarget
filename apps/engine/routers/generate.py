@@ -1,4 +1,6 @@
 import hashlib
+import json
+import logging
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException
@@ -6,6 +8,10 @@ from pydantic import BaseModel, Field
 
 from db.client import get_supabase
 from topics import TOPIC_METADATA, TOPIC_REGISTRY, ProblemResult
+from steps.scripted import StepSolution
+from steps.ai_steps import get_steps
+
+_LOG = logging.getLogger(__name__)
 
 router = APIRouter(tags=["generate"])
 
@@ -20,20 +26,27 @@ def _cache_key(topic: str, difficulty: str, seed: int) -> str:
     return hashlib.sha256(f"{topic}:{difficulty}:{seed}".encode()).hexdigest()
 
 
-def _row_to_result(row: dict, seed: int, difficulty: str) -> ProblemResult:
-    return ProblemResult(
-        problem_latex=row["problem_latex"],
-        answer_latex=row["answer_latex"],
-        answer_exact=row["answer_exact"],
-        seed_used=seed,
-        difficulty=difficulty,
-        standard_codes=row["standard_codes"] or [],
-    )
+def _cached_step_solution(row: dict) -> StepSolution | None:
+    """Reconstruct a StepSolution from a cache row that already has verified steps."""
+    if not row.get("steps_verified") or not row.get("steps"):
+        return None
+    raw = row["steps"]
+    if isinstance(raw, str):
+        raw = json.loads(raw)
+    try:
+        return StepSolution(**raw)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
 # Request / response models
 # ---------------------------------------------------------------------------
+
+
+class ProblemResultWithSteps(ProblemResult):
+    """ProblemResult extended with an optional verified step solution."""
+    step_solution: StepSolution | None = None
 
 
 class GenerateRequest(BaseModel):
@@ -42,6 +55,7 @@ class GenerateRequest(BaseModel):
     count: int = Field(ge=1, le=40)
     seed: int
     version: int = Field(default=1, ge=1)
+    include_steps: bool = False
 
 
 class GenerateResponse(BaseModel):
@@ -49,7 +63,7 @@ class GenerateResponse(BaseModel):
     difficulty: str
     version: int
     seed: int
-    problems: list[ProblemResult]
+    problems: list[ProblemResultWithSteps]
 
 
 class TopicInfo(BaseModel):
@@ -88,45 +102,71 @@ def generate(body: GenerateRequest) -> GenerateResponse:
 
     all_hashes = [h for _, h in slots]
 
-    # Single batched cache lookup — avoids N round-trips for N problems.
+    # Batched cache lookup (skipped when Supabase is not configured).
     supabase = get_supabase()
-    cached_rows = (
-        supabase.table("problem_cache")
-        .select("problem_hash, problem_latex, answer_latex, answer_exact, standard_codes")
-        .in_("problem_hash", all_hashes)
-        .execute()
-    )
-    cache_map: dict[str, dict] = {row["problem_hash"]: row for row in (cached_rows.data or [])}
+    cache_map: dict[str, dict] = {}
+    if supabase is not None:
+        cached_rows = (
+            supabase.table("problem_cache")
+            .select("problem_hash, problem_latex, answer_latex, answer_exact, standard_codes, steps, steps_verified")
+            .in_("problem_hash", all_hashes)
+            .execute()
+        )
+        cache_map = {row["problem_hash"]: row for row in (cached_rows.data or [])}
 
     topic_instance = TOPIC_REGISTRY[body.topic]()
-    problems: list[ProblemResult] = []
+    problems: list[ProblemResultWithSteps] = []
     to_insert: list[dict] = []
 
     for effective_seed, cache_hash in slots:
         if cache_hash in cache_map:
-            result = _row_to_result(cache_map[cache_hash], effective_seed, body.difficulty)
+            _LOG.info("CACHE HIT: %s", cache_hash)
+            row = cache_map[cache_hash]
+            result = ProblemResultWithSteps(
+                problem_latex=row["problem_latex"],
+                answer_latex=row["answer_latex"],
+                answer_exact=row["answer_exact"],
+                seed_used=effective_seed,
+                difficulty=body.difficulty,
+                standard_codes=row["standard_codes"] or [],
+                # Use cached verified steps immediately — no API call needed.
+                step_solution=_cached_step_solution(row) if body.include_steps else None,
+            )
         else:
+            _LOG.info("CACHE MISS: %s", cache_hash)
             try:
-                result = topic_instance.generate_valid(
+                pr = topic_instance.generate_valid(
                     seed=effective_seed,
                     difficulty=body.difficulty,
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+            result = ProblemResultWithSteps(**pr.model_dump())
             to_insert.append({
                 "problem_hash": cache_hash,
                 "topic": body.topic,
-                "problem_latex": result.problem_latex,
-                "answer_latex": result.answer_latex,
-                "answer_exact": result.answer_exact,
-                "standard_codes": result.standard_codes,
+                "problem_latex": pr.problem_latex,
+                "answer_latex": pr.answer_latex,
+                "answer_exact": pr.answer_exact,
+                "standard_codes": pr.standard_codes,
             })
+
+        # Call get_steps() only when needed: steps requested AND not already
+        # satisfied from the cache above.
+        if body.include_steps and result.step_solution is None:
+            try:
+                result.step_solution = get_steps(body.topic, result)
+            except Exception as exc:
+                _LOG.warning(
+                    "get_steps failed for topic=%s seed=%d: %s",
+                    body.topic, effective_seed, exc,
+                )
 
         problems.append(result)
 
-    # Single batched insert for all cache misses.
-    if to_insert:
+    # Batched insert for all cache misses (skipped without Supabase).
+    if to_insert and supabase is not None:
         supabase.table("problem_cache").insert(to_insert).execute()
 
     return GenerateResponse(

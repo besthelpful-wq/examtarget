@@ -11,6 +11,7 @@ equations) are split into individual lines before rendering.
 
 import io
 import re
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
@@ -21,12 +22,25 @@ router = APIRouter(tags=["export"])
 
 # ─── Request model ────────────────────────────────────────────────────────────
 
+class StepInput(BaseModel):
+    description: str
+    math_latex: str
+
+
+class StepSolutionInput(BaseModel):
+    steps: list[StepInput]
+    final_answer_latex: str
+    method: str
+    verified: bool = True
+
+
 class ProblemInput(BaseModel):
     problem_latex: str
     answer_latex: str
     seed_used: int
     difficulty: str
     standard_codes: list[str]
+    step_solution: StepSolutionInput | None = None
 
 
 class ExportPDFRequest(BaseModel):
@@ -36,6 +50,8 @@ class ExportPDFRequest(BaseModel):
     version: int
     problems: list[ProblemInput]
     include_answer_key: bool
+    include_steps: bool = False
+    steps_placement: Literal["inline", "separate_page"] = "inline"
     title: str = "Worksheet"
     teacher_name: str = ""
     class_period: str = ""
@@ -106,6 +122,8 @@ _CW       = 215.9 - 2 * _MARGIN   # content width  ≈ 165.1 mm
 _NUM_W    = 8.0           # number column width
 _WORK_H   = 30.0          # work-space height (≈ 3 cm)
 _ROW_H    = 12.0          # answer-key row height
+_STEP_IMG_W = min(_CW - 16, 110.0)   # max width for step math images
+_STEP_IMG_H = 8.5                     # assumed rendered height per math line
 
 
 # ─── Header ──────────────────────────────────────────────────────────────────
@@ -149,9 +167,54 @@ def _draw_header(pdf: object, title: str, teacher: str, period: str, date: str) 
     pdf.set_y(ry + 4)
 
 
+# ─── Step solution rendering ──────────────────────────────────────────────────
+
+def _draw_step_solution(pdf: object, solution: StepSolutionInput) -> None:
+    """
+    Draw step-by-step solution at the current y position.
+    Uses relative positioning so auto-page-break handles overflow.
+    """
+    from fpdf import FPDF
+    assert isinstance(pdf, FPDF)
+
+    # "Solution" label
+    pdf.set_font("Helvetica", style="I", size=8.5)
+    pdf.set_text_color(90, 60, 180)
+    pdf.set_xy(_MARGIN, pdf.get_y() + 1)
+    pdf.cell(_CW, 4.5, "Solution:", ln=True)
+    pdf.set_text_color(0, 0, 0)
+
+    for i, step in enumerate(solution.steps, 1):
+        # Step number + description text
+        pdf.set_font("Helvetica", size=8.5)
+        pdf.set_xy(_MARGIN + 4, pdf.get_y())
+        label = f"{i}.  "
+        full_text = label + step.description
+        pdf.multi_cell(_CW - 4, 4.5, full_text, align="L")
+
+        # Step math expression
+        try:
+            png = _render_math_png(step.math_latex, fontsize=10.5)
+            img_y = pdf.get_y()
+            pdf.image(io.BytesIO(png), x=_MARGIN + 14, y=img_y, w=_STEP_IMG_W)
+            pdf.set_y(img_y + _STEP_IMG_H)
+        except Exception:
+            pdf.set_font("Courier", size=8.5)
+            pdf.set_xy(_MARGIN + 14, pdf.get_y())
+            pdf.cell(_CW - 14, 4.5, step.math_latex[:70], ln=True)
+
+        pdf.ln(0.5)
+
+    pdf.ln(2)
+
+
 # ─── Problems page ────────────────────────────────────────────────────────────
 
-def _draw_problems(pdf: object, problems: list[ProblemInput]) -> None:
+def _draw_problems(
+    pdf: object,
+    problems: list[ProblemInput],
+    include_steps_inline: bool = False,
+) -> None:
     from fpdf import FPDF
     assert isinstance(pdf, FPDF)
 
@@ -181,10 +244,16 @@ def _draw_problems(pdf: object, problems: list[ProblemInput]) -> None:
                 pdf.cell(eq_mw, 7, line_latex[:80])
                 ey += 7
 
-        # Work space
-        ws_y = max(py + 11, ey + 2)
-        pdf.set_y(ws_y)
-        pdf.ln(_WORK_H)
+        after_eq_y = max(py + 11, ey + 2)
+        pdf.set_y(after_eq_y)
+
+        if include_steps_inline and p.step_solution:
+            # Steps replace the blank work space
+            _draw_step_solution(pdf, p.step_solution)
+        else:
+            # Blank work space for student
+            pdf.ln(_WORK_H)
+
         rule_y = pdf.get_y()
         pdf.set_draw_color(200, 200, 200)
         pdf.line(_MARGIN, rule_y, _MARGIN + _CW, rule_y)
@@ -229,6 +298,44 @@ def _draw_answers(pdf: object, problems: list[ProblemInput]) -> None:
     pdf.set_y(start_y + rows * _ROW_H + 4)
 
 
+# ─── Separate solutions page ─────────────────────────────────────────────────
+
+def _draw_solutions_page(pdf: object, problems: list[ProblemInput]) -> None:
+    """Add a new page with full step-by-step solutions for every problem."""
+    from fpdf import FPDF
+    assert isinstance(pdf, FPDF)
+
+    pdf.add_page()
+
+    # Page title
+    pdf.set_font("Times", style="B", size=13)
+    pdf.set_xy(_MARGIN, pdf.get_y())
+    pdf.cell(_CW, 7, "Step-by-Step Solutions", align="L", ln=True)
+    pdf.set_line_width(0.4)
+    rule_y = pdf.get_y()
+    pdf.line(_MARGIN, rule_y, _MARGIN + _CW, rule_y)
+    pdf.set_line_width(0.2)
+    pdf.ln(5)
+
+    for i, p in enumerate(problems, 1):
+        if not p.step_solution:
+            continue
+
+        # Problem number header
+        pdf.set_font("Times", style="B", size=10)
+        pdf.set_xy(_MARGIN, pdf.get_y())
+        pdf.cell(_CW, 5.5, f"Problem {i}", ln=True)
+
+        _draw_step_solution(pdf, p.step_solution)
+
+        # Thin separator between problems
+        sep_y = pdf.get_y()
+        pdf.set_draw_color(210, 210, 210)
+        pdf.line(_MARGIN, sep_y, _MARGIN + _CW, sep_y)
+        pdf.set_draw_color(0, 0, 0)
+        pdf.ln(4)
+
+
 # ─── Document assembly ────────────────────────────────────────────────────────
 
 def _make_pdf(r: ExportPDFRequest) -> bytes:
@@ -251,14 +358,19 @@ def _make_pdf(r: ExportPDFRequest) -> bytes:
     pdf.set_auto_page_break(auto=True, margin=_MARGIN)
     pdf.set_margins(_MARGIN, _MARGIN, _MARGIN)
 
+    # Problems page — inline steps replace work space; separate-page keeps it
+    inline = r.include_steps and r.steps_placement == "inline"
     pdf.add_page()
     _draw_header(pdf, r.title, r.teacher_name, r.class_period, r.date)
-    _draw_problems(pdf, r.problems)
+    _draw_problems(pdf, r.problems, include_steps_inline=inline)
 
     if r.include_answer_key:
         pdf.add_page()
         _draw_header(pdf, f"{r.title} - Answer Key", "", "", "")
         _draw_answers(pdf, r.problems)
+
+    if r.include_steps and r.steps_placement == "separate_page":
+        _draw_solutions_page(pdf, r.problems)
 
     return bytes(pdf.output())
 

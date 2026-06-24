@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { UserButton } from "@clerk/nextjs";
 import katex from "katex";
 import "katex/dist/katex.min.css";
@@ -13,12 +13,25 @@ interface TopicInfo {
   standard_codes: string[];
 }
 
+interface Step {
+  description: string;
+  math_latex: string;
+}
+
+interface StepSolution {
+  steps: Step[];
+  final_answer_latex: string;
+  method: string;
+  verified: boolean;
+}
+
 interface ProblemResult {
   problem_latex: string;
   answer_latex: string;
   seed_used: number;
   difficulty: string;
   standard_codes: string[];
+  step_solution?: StepSolution | null;
 }
 
 interface Worksheet {
@@ -30,6 +43,7 @@ interface Worksheet {
 }
 
 type Difficulty = "easy" | "medium" | "hard";
+type StepsPlacement = "inline" | "separate_page";
 
 const VERSION_LABELS = ["A", "B", "C", "D"] as const;
 const DIFFICULTIES: Difficulty[] = ["easy", "medium", "hard"];
@@ -113,16 +127,66 @@ function Spinner() {
   );
 }
 
+// ─── Steps section (collapsible) ──────────────────────────────────────────────
+
+function StepsSection({ solution }: { solution: StepSolution }) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div className="mt-3 border-t border-dashed border-gray-200 pt-3">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-widest text-indigo-500 transition-colors hover:text-indigo-700"
+      >
+        {/* chevron */}
+        <svg
+          className={`h-3 w-3 transition-transform duration-150 ${open ? "rotate-90" : ""}`}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={2.5}
+          viewBox="0 0 24 24"
+        >
+          <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+        </svg>
+        {open ? "Hide" : "Show"} step-by-step solution
+      </button>
+
+      {open && (
+        <ol className="mt-3 space-y-3 pl-1">
+          {solution.steps.map((step, i) => (
+            <li key={i} className="flex gap-3">
+              <span className="mt-0.5 shrink-0 text-xs font-bold tabular-nums text-gray-400">
+                {i + 1}.
+              </span>
+              <div className="min-w-0 flex-1">
+                <p className="text-sm leading-snug text-gray-600">
+                  {step.description}
+                </p>
+                <div className="mt-1 overflow-x-auto py-0.5 text-sm">
+                  <KaTeXSpan latex={step.math_latex} display />
+                </div>
+              </div>
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
+
 // ─── Problem card ─────────────────────────────────────────────────────────────
 
 function ProblemCard({
   index,
   problem,
   showAnswer,
+  showSteps,
 }: {
   index: number;
   problem: ProblemResult;
   showAnswer: boolean;
+  showSteps: boolean;
 }) {
   return (
     <div className="group rounded-xl border border-gray-200 bg-white px-5 py-4 shadow-xs transition-shadow hover:shadow-sm">
@@ -145,6 +209,20 @@ function ProblemCard({
               </span>
               <span className="overflow-x-auto text-sm text-gray-700">
                 <KaTeXSpan latex={problem.answer_latex} />
+              </span>
+            </div>
+          )}
+
+          {/* Step-by-step solution */}
+          {showSteps && problem.step_solution && (
+            <StepsSection solution={problem.step_solution} />
+          )}
+
+          {/* Loading placeholder when steps were requested but not yet returned */}
+          {showSteps && problem.step_solution === null && (
+            <div className="mt-3 border-t border-dashed border-gray-200 pt-3">
+              <span className="text-xs text-gray-400 italic">
+                Steps unavailable for this problem.
               </span>
             </div>
           )}
@@ -192,9 +270,15 @@ export default function BuilderClient() {
   const [worksheets, setWorksheets] = useState<Worksheet[]>([]);
   const [activeTab, setActiveTab] = useState(0);
   const [showAnswerKey, setShowAnswerKey] = useState(false);
+  const [includeSteps, setIncludeSteps] = useState(false);
+  const [stepsPlacement, setStepsPlacement] = useState<StepsPlacement>("inline");
   const [generating, setGenerating] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [genError, setGenError] = useState<string | null>(null);
+
+  // Saved so the steps toggle can re-fetch with the same seed
+  const [lastSeed, setLastSeed] = useState<number | null>(null);
+  const lastSeedRef = useRef<number | null>(null);
 
   const previewRef = useRef<HTMLDivElement>(null);
 
@@ -212,52 +296,74 @@ export default function BuilderClient() {
       .catch(() => setTopicsErr(true));
   }, []);
 
-  const handleGenerate = async () => {
-    if (!topic) return;
-    setGenerating(true);
-    setGenError(null);
-    setWorksheets([]);
+  // ─── Core fetch ─────────────────────────────────────────────────────────────
 
-    const seed = (Math.random() * 100_000) | 0;
-    const numVersions = multiVersion ? versionCount : 1;
+  const doFetch = useCallback(
+    async (seed: number, withSteps: boolean) => {
+      if (!topic) return;
+      setGenerating(true);
+      setGenError(null);
+      setWorksheets([]);
+      setLastSeed(seed);
+      lastSeedRef.current = seed;
 
-    try {
-      const requests = Array.from({ length: numVersions }, (_, i) =>
-        fetch(`${ENGINE}/generate`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            topic,
-            difficulty,
-            count,
-            seed,
-            version: i + 1,
+      const numVersions = multiVersion ? versionCount : 1;
+
+      try {
+        const requests = Array.from({ length: numVersions }, (_, i) =>
+          fetch(`${ENGINE}/generate`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              topic,
+              difficulty,
+              count,
+              seed,
+              version: i + 1,
+              include_steps: withSteps,
+            }),
+          }).then(async (r) => {
+            if (!r.ok) {
+              const body = await r.json().catch(() => ({})) as { detail?: string };
+              throw new Error(body.detail ?? `HTTP ${r.status}`);
+            }
+            return r.json() as Promise<Worksheet>;
           }),
-        }).then(async (r) => {
-          if (!r.ok) {
-            const body = await r.json().catch(() => ({})) as { detail?: string };
-            throw new Error(body.detail ?? `HTTP ${r.status}`);
-          }
-          return r.json() as Promise<Worksheet>;
-        }),
-      );
+        );
 
-      const results = await Promise.all(requests);
-      setWorksheets(results);
-      setActiveTab(0);
-      setShowAnswerKey(false);
+        const results = await Promise.all(requests);
+        setWorksheets(results);
+        setActiveTab(0);
+        setShowAnswerKey(false);
 
-      // Smooth scroll to preview
-      setTimeout(
-        () => previewRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }),
-        80,
-      );
-    } catch (e) {
-      setGenError((e as Error).message);
-    } finally {
-      setGenerating(false);
+        setTimeout(
+          () => previewRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }),
+          80,
+        );
+      } catch (e) {
+        setGenError((e as Error).message);
+      } finally {
+        setGenerating(false);
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [topic, difficulty, count, multiVersion, versionCount],
+  );
+
+  const handleGenerate = () => {
+    const seed = (Math.random() * 100_000) | 0;
+    doFetch(seed, includeSteps);
+  };
+
+  // Re-fetch with steps when the toggle turns on and we already have problems
+  const handleStepsToggle = (val: boolean) => {
+    setIncludeSteps(val);
+    if (val && worksheets.length > 0 && lastSeedRef.current !== null) {
+      doFetch(lastSeedRef.current, true);
     }
   };
+
+  // ─── PDF export ─────────────────────────────────────────────────────────────
 
   const handleDownloadPDF = async () => {
     if (!current) return;
@@ -270,6 +376,11 @@ export default function BuilderClient() {
         worksheets.length > 1 ? ` — Version ${VERSION_LABELS[activeTab]}` : "";
       const title = `${topicLabel}${versionSuffix}`;
 
+      // Strip step_solution when not requested to keep the payload lean
+      const problems = includeSteps
+        ? current.problems
+        : current.problems.map(({ step_solution: _s, ...rest }) => rest);
+
       const res = await fetch(`${ENGINE}/export/pdf`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -278,8 +389,10 @@ export default function BuilderClient() {
           difficulty: current.difficulty,
           seed: current.seed,
           version: current.version,
-          problems: current.problems,
+          problems,
           include_answer_key: showAnswerKey,
+          include_steps: includeSteps,
+          steps_placement: stepsPlacement,
           title,
         }),
       });
@@ -468,7 +581,9 @@ export default function BuilderClient() {
           <div className="flex flex-col items-center gap-3 py-20 text-gray-400">
             <div className="h-8 w-8 animate-spin rounded-full border-4 border-indigo-600 border-t-transparent" />
             <span className="text-sm">
-              Generating {count} problem{count !== 1 ? "s" : ""}…
+              {includeSteps
+                ? `Generating ${count} problem${count !== 1 ? "s" : ""} with solutions…`
+                : `Generating ${count} problem${count !== 1 ? "s" : ""}…`}
             </span>
           </div>
         )}
@@ -507,22 +622,54 @@ export default function BuilderClient() {
               </div>
             )}
 
-            {/* Toggles */}
-            <div className="flex flex-wrap items-center gap-x-8 gap-y-3 rounded-xl border border-gray-200 bg-white px-5 py-4">
-              <Toggle
-                id="answer-key"
-                checked={showAnswerKey}
-                onChange={setShowAnswerKey}
-                label="Include answer key"
-              />
-              <Toggle
-                id="step-solutions"
-                checked={false}
-                onChange={() => {}}
-                label="Step-by-step solutions"
-                sublabel="(Phase 2)"
-                disabled
-              />
+            {/* Toggles + steps placement */}
+            <div className="rounded-xl border border-gray-200 bg-white px-5 py-4 space-y-4">
+              <div className="flex flex-wrap items-center gap-x-8 gap-y-3">
+                <Toggle
+                  id="answer-key"
+                  checked={showAnswerKey}
+                  onChange={setShowAnswerKey}
+                  label="Include answer key"
+                />
+                <Toggle
+                  id="step-solutions"
+                  checked={includeSteps}
+                  onChange={handleStepsToggle}
+                  label="Step-by-step solutions"
+                />
+              </div>
+
+              {/* Steps placement — only shown when steps are on */}
+              {includeSteps && (
+                <div className="ml-14 space-y-2 border-t border-gray-100 pt-3">
+                  <span className="text-sm font-medium text-gray-700">
+                    PDF placement
+                  </span>
+                  <div className="flex gap-5">
+                    {(
+                      [
+                        { value: "inline", label: "After each problem" },
+                        { value: "separate_page", label: "Separate solutions page" },
+                      ] as { value: StepsPlacement; label: string }[]
+                    ).map(({ value, label }) => (
+                      <label
+                        key={value}
+                        className="flex cursor-pointer items-center gap-2"
+                      >
+                        <input
+                          type="radio"
+                          name="steps-placement"
+                          value={value}
+                          checked={stepsPlacement === value}
+                          onChange={() => setStepsPlacement(value)}
+                          className="accent-indigo-600"
+                        />
+                        <span className="text-sm text-gray-700">{label}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Problems */}
@@ -533,6 +680,7 @@ export default function BuilderClient() {
                   index={i}
                   problem={p}
                   showAnswer={showAnswerKey}
+                  showSteps={includeSteps}
                 />
               ))}
             </div>
